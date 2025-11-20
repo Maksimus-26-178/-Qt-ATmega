@@ -1,0 +1,636 @@
+#include <avr/io.h>
+#include <util/delay.h> // библиотека для работы с задержками
+#include <SPI.h> // библиотека для работы с SPI
+#include "mcp2515.h"
+#include <avr/interrupt.h>
+#include "obmen_po_CAN.h"
+#include "obmen_po_CAN_zapros_sost.h"
+
+volatile uint32_t milli_seconds = 0; 
+volatile uint32_t modul_ispraven = 0;
+volatile uint32_t timer = 0;
+
+// найстройка таймера
+void init_timer()
+{
+	// настройка таймера в режиме CTC (Clear Timer on Compare Match) с частотой срабатывания 1 кГц (1 мс)
+	TCCR1A = 0; // сброс регистра TCCR1A (обнуление этой настройки сбрасывает настройки таймера)
+	TCCR1B = 0; // сброс регистра TCCR1B (обнуление этой настройки сбрасывает настройки таймера)
+	TCNT1 = 0; // обнуление счетчика таймера
+
+	// установка бита WGM12
+	TCCR1B |= (1 << WGM12);
+
+	// установка предделителя на 64
+	TCCR1B |= (1 << CS11) | (1 << CS10);
+
+	// по формуле...
+	OCR1A = (8000000 / 64 / 1000) - 1;
+
+	// разрешаем прерывания
+	sei();
+}
+
+const int SPI_CS_PIN = 21; // выбор пина для chip select (CS) SPI
+const int CAN_INT_PIN = 20; // пин прерывания (INT) от CAN-модуля
+long f_ERR = 0; // счетчик ошибок, обнуляем его
+MCP2515 canModule(SPI_CS_PIN);
+struct can_frame canInput; // структура для хранения входящего CAN-сообщения
+struct can_frame canOutput; // структура для хранения исходящего CAN-сообщения
+MCP2515::ERROR canResult; // переменная для хранения результата операций с CAN
+
+void setup()
+{
+	// настраиваем порты...
+	DDRC = 0x00; 
+	DDRF = 0x00; 
+	DDRA = 0xFF; 
+	DDRB = 0xF6; 
+	DDRD = 0xC; 
+	DDRE = 0b0010; 
+	DDRG = 0x00; 
+
+		// настраиваем CAN	
+	canModule.reset(); // сбрасываем все настройки в начальное состояние
+	canModule.setBitrate(CAN_125KBPS, MCP_8MHZ); // настраиваем скорость шины и частоту кварцевого резонатора
+	canModule.setNormalMode(); // устанавливаем нормальный режим работы (прием/отправка)
+
+	// настраиваем модуль CAN на приемку только определенных сообщений (с нужным нам ID)
+	canModule.setConfigMode();
+	canModule.setFilterMask(MCP2515::MASK0, false, 0xFFF);
+	canModule.setFilter(MCP2515::RXF0, false, 0xAAA);
+	canModule.setFilter(MCP2515::RXF1, false, 0xAAA);
+	canModule.setNormalMode();
+
+}
+
+// добавляем макросы
+#define PIN_PC0 PC0
+#define PIN_PC1 PC1
+#define PIN_PC2 PC2
+#define PIN_PC3 PC3
+#define PIN_PC4 PC4
+#define PIN_PC5 PC5
+#define PIN_PC6 PC6
+#define PIN_PC7 PC7
+
+#define PIN_PF0 PF0
+#define PIN_PF1 PF1
+#define PIN_PF2 PF2
+#define PIN_PF3 PF3
+#define PIN_PF4 PF4
+#define PIN_PF5 PF5
+#define PIN_PF6 PF6
+#define PIN_PF7 PF7
+
+#define PIN_PB0 PB0
+
+#define PIN_PD4 PD4
+
+#define PIN_PD5 PD5
+
+volatile uint8_t signal_received_PC[8] = {0}; // массив для отслеживания состояния пинов C
+volatile uint8_t signal_received_PF[8] = {0}; // массив для отслеживания состояния пинов F
+volatile uint8_t signal_received_PB[8] = {0}; // массив для отслеживания состояния пинов B
+volatile uint8_t signal_received_PD[8] = {0}; // массив для отслеживания состояния пинов D
+
+void check_port_c_pins(void) {
+	if (PINC & (1 << PIN_PC0)){ signal_received_PC[0] = 1;} else { signal_received_PC[0] = 0;}
+	if (PINC & (1 << PIN_PC1)){ signal_received_PC[1] = 1;} else { signal_received_PC[1] = 0;}
+	if (PINC & (1 << PIN_PC2)){ signal_received_PC[2] = 1;} else { signal_received_PC[2] = 0;}
+	if (PINC & (1 << PIN_PC3)){ signal_received_PC[3] = 1;} else { signal_received_PC[3] = 0;}
+	if (PINC & (1 << PIN_PC4)){ signal_received_PC[4] = 1;} else { signal_received_PC[4] = 0;}
+	if (PINC & (1 << PIN_PC5)){ signal_received_PC[5] = 1;} else { signal_received_PC[5] = 0;}
+	if (PINC & (1 << PIN_PC6)){ signal_received_PC[6] = 1;} else { signal_received_PC[6] = 0;}
+	if (PINC & (1 << PIN_PC7)){ signal_received_PC[7] = 1;} else { signal_received_PC[7] = 0;}
+}
+
+void check_port_f_pins(void) {
+	if (PINF & (1 << PIN_PF0)){ signal_received_PF[0] = 1;} else { signal_received_PF[0] = 0;}
+	if (PINF & (1 << PIN_PF1)){ signal_received_PF[1] = 1;} else { signal_received_PF[1] = 0;}
+	if (PINF & (1 << PIN_PF2)){ signal_received_PF[2] = 1;} else { signal_received_PF[2] = 0;}
+	if (PINF & (1 << PIN_PF3)){ signal_received_PF[3] = 1;} else { signal_received_PF[3] = 0;}
+	if (PINF & (1 << PIN_PF4)){ signal_received_PF[4] = 1;} else { signal_received_PF[4] = 0;}
+	if (PINF & (1 << PIN_PF5)){ signal_received_PF[5] = 1;} else { signal_received_PF[5] = 0;}
+	if (PINF & (1 << PIN_PF6)){ signal_received_PF[6] = 1;} else { signal_received_PF[6] = 0;}
+	if (PINF & (1 << PIN_PF7)){ signal_received_PF[7] = 1;} else { signal_received_PF[7] = 0;}
+}
+
+void check_port_b0_pins(void) {
+	if (PINB & (1 << PIN_PB0)){ signal_received_PB[0] = 1;} else { signal_received_PB[0] = 0;}
+}
+
+void check_port_PD4_PD5_pins(void) {
+	if (PIND & (1 << PIN_PD4)){ signal_received_PD[4] = 1;} else { signal_received_PD[4] = 0;}
+	if (PIND & (1 << PIN_PD5)){ signal_received_PD[5] = 1;} else { signal_received_PD[5] = 0;}
+}
+
+void SET_Vix (int N_Vix) { //N_Vix ot 1 do 12
+	switch (N_Vix)
+	{
+	case 1:
+		PORTA |= (1 << PA4); // включаем ножку PA4
+		break;
+	case 2:
+		PORTA |= (1 << PA5); // включаем ножку PA5
+		break;
+	case 3:
+		PORTA |= (1 << PA6); // включаем ножку PA6
+		break;
+	case 4:
+		PORTA |= (1 << PA7); // включаем ножку PA7
+		break;
+	case 5:
+		PORTB |= (1 << PB4); // включаем ножку PB4
+		break;
+	case 6:
+		PORTB |= (1 << PB5); // включаем ножку PB5
+		break;
+	case 7:
+		PORTB |= (1 << PB6); // включаем ножку PB6
+		break;
+	case 8:
+		PORTB |= (1 << PB7); // включаем ножку PB7
+		break;
+	default:
+		break;
+	}
+
+	return;
+}
+
+void CLEAR_Vix (int N_Vix) { //N_Vix ot 1 do 12
+	switch (N_Vix)
+	{
+	case 1:
+		PORTA &= ~(1 << PA4); // выключаем ножку PA4
+		break;
+	case 2:
+		PORTA &= ~(1 << PA5); // выключаем ножку PA5
+		break;
+	case 3:
+		PORTA &= ~(1 << PA6); // выключаем ножку PA6
+		break;
+	case 4:
+		PORTA &= ~(1 << PA7); // выключаем ножку PA7
+		break;
+	case 5: 
+		PORTB &= ~(1 << PB4); // ?выключаем ножку PB4
+		break;
+	case 6:
+		PORTB &= ~(1 << PB5); // выключаем ножку PB5
+		break;
+	case 7:
+		PORTB &= ~(1 << PB6); // выключаем ножку PB6
+		break;
+	case 8:
+		PORTB &= ~(1 << PB7); // выключаем ножку PB7
+		break;
+	default:
+		break;
+	}
+
+	return;
+	
+}
+
+int SCAN_Vx(int N_Vx) { //Vx ot 1 do 16
+	if((N_Vx >= 1) & (N_Vx <= 8)) {
+		return signal_received_PC[N_Vx-1]; 
+	}
+	
+
+	if ((N_Vx >= 9) & (N_Vx <= 16)) {
+		return signal_received_PF[N_Vx-8]; 
+	}
+	return 2;
+}
+
+void Prov_vx_vix(int vx1, int vx2, int vix) {  
+	SET_Vix(vix);
+	_delay_ms(3); 
+	check_port_c_pins(); 
+	check_port_f_pins(); 
+		if (SCAN_Vx(vx1) && SCAN_Vx(vx1)) 
+		{ 
+			// ничего не делаем
+		}
+		
+		else { 
+			f_ERR++;	// увеличиваем счетчик ошибок на 1
+
+			if ((signal_received_PC[0] = 0) || (signal_received_PF[0] = 0)) {  // PC0, PF0, PA4
+			
+			Soobshenie_po_CAN(MK_INTERFACE_B1, "НАРУШЕНА СВЯЗЬ: ВХ1, ВХ9, ВЫХ5\n");
+				 
+			}
+
+			if ((signal_received_PC[1] = 0) || (signal_received_PF[1] = 0)) {  // PC1, PF1, PA5
+
+			Soobshenie_po_CAN(MK_INTERFACE_B1, "НАРУШЕНА СВЯЗЬ: ВХ2, ВХ10, ВЫХ6\n");
+				 
+			}
+
+			if ((signal_received_PC[2] = 0) || (signal_received_PF[2] = 0)) {  // PC2, PF2, PA6
+			
+			Soobshenie_po_CAN(MK_INTERFACE_B1, "НАРУШЕНА СВЯЗЬ: ВХ3, ВХ11, ВЫХ7\n");
+				 			
+			}
+
+			if ((signal_received_PC[3] = 0) || (signal_received_PF[3] = 0)) {  // PC3, PF3, PA7
+			
+			Soobshenie_po_CAN(MK_INTERFACE_B1, "НАРУШЕНА СВЯЗЬ: ВХ4, ВХ12, ВЫХ8\n");
+					
+			}
+
+			if ((signal_received_PC[4] = 0) || (signal_received_PF[4] = 0)) {  // PC4, PF4, PB4
+
+			Soobshenie_po_CAN(MK_INTERFACE_B1, "НАРУШЕНА СВЯЗЬ: ВХ5, ВХ13, ВЫХ9\n");
+			
+			}
+
+			if ((signal_received_PC[5] = 0) || (signal_received_PF[5] = 0)) {  // PC5, PF5, PB5
+
+			Soobshenie_po_CAN(MK_INTERFACE_B1, "НАРУШЕНА СВЯЗЬ: ВХ6, ВХ14, ВЫХ10\n");
+							
+			}
+
+			if ((signal_received_PC[6] = 0) || (signal_received_PF[6] = 0)) {  // PC6, PF6, PB6
+
+			Soobshenie_po_CAN(MK_INTERFACE_B1, "НАРУШЕНА СВЯЗЬ: ВХ7, ВХ15, ВЫХ11\n");
+					
+			}
+
+			if ((signal_received_PC[7] = 0) || (signal_received_PF[7] = 0)) {  // PC7, PF7, PB7
+
+			Soobshenie_po_CAN(MK_INTERFACE_B1, "НАРУШЕНА СВЯЗЬ: ВХ8, ВХ16, ВЫХ12\n");
+	
+			}
+
+			return;
+		}
+
+	CLEAR_Vix(vix);
+	
+}
+
+char prov_VX1_16_VIX5_12_MK=0;  // переменная разовой проверки
+char prov_nepr_work_MK=0;  // переменная непрерывной проверки
+
+ISR(TIMER0_COMP_vect)
+{
+	milli_seconds++;
+	if ((milli_seconds >= 172800000) &&  (f_ERR = 0))  // 48 ч = 172800000 мс
+	{  
+	modul_ispraven = 1;
+	}
+}
+
+void loop() {
+		
+	if (canModule.readMessage(&canInput) == MCP2515::ERROR_OK) // если пришло сообщение по CAN
+	{
+		// если dlc равен нулю, то есть сообщение пустое
+		if (canInput.can_dlc == 0)
+		{
+			// ничего не делаем
+		}
+		else
+		{
+			// анализируем 1-й байт данный (в зависимости от того, какой он - выполняем определенное действие)
+			switch (canInput.data[0]) 
+			{
+				case 0xA1:  // запрос состояния
+					// ответ на запрос состояния
+					Soobshenie_po_CAN_zapr_sost(MK_INTERFACE_A1, "МОДУЛЬ ГОТОВ!ТЕХНОЛОГИЧЕСКАЯ ПРОГРАММА!\n"); 
+					break;
+				
+				case 0xC1:  // запрос начала разовой проверки функционирования
+					prov_VX1_16_VIX5_12_MK = 1;  // старт проверки функционирования
+					// отправляем отчет о начале проверки
+					canOutput.can_id	= 0xAAA;
+					canOutput.can_dlc	= 2;
+					canOutput.data[0]	= 0xC1;  
+					canOutput.data[1]	= 0x01;  
+
+					canResult = canModule.sendMessage(&canOutput);
+					break;
+
+				case 0xC7:  // запрос началанепрерывной проверки
+					prov_nepr_work_MK = 1; // старт непрерывной проверки
+					// отправляем отчет о начале непрерывной проверки
+					canOutput.can_id	= 0xAAA;
+					canOutput.can_dlc	= 2;
+					canOutput.data[0]	= 0xC7;  
+					canOutput.data[1]	= 0x01;
+					
+					canResult = canModule.sendMessage(&canOutput);
+					break;
+
+				case 0xC8:  // запрос на остановку непрерывнойпроверки 
+					prov_nepr_work_MK = 0; // стоп непрерывной проверке 
+					// отправляем отчет об остановке непрерывной проверки
+					canOutput.can_id	= 0xAAA;
+					canOutput.can_dlc	= 2;
+					canOutput.data[0]	= 0xC8;  
+					canOutput.data[1]	= 0x01;
+					
+					canResult = canModule.sendMessage(&canOutput);
+					break;
+
+				default:
+					break;
+
+			}
+			
+		}
+
+	}
+
+	if (prov_VX1_16_VIX5_12_MK == 1)  {
+		Prov_vx_vix(1,9,1);
+		Prov_vx_vix(2,10,2);
+		Prov_vx_vix(3,11,3);
+		Prov_vx_vix(4,12,4);
+		Prov_vx_vix(5,13,5);
+		Prov_vx_vix(6,14,6);
+		Prov_vx_vix(7,15,7);
+		Prov_vx_vix(8,16,8);
+
+		prov_VX1_16_VIX5_12_MK = 0;  
+
+		Soobshenie_po_CAN(MK_INTERFACE_B1, "Проверка ВХОДОВ(№№1-16) и ВЫХОДОВ(№№5-12) завершена успешно!\n");
+
+		_delay_ms(1000);
+
+		Soobshenie_po_CAN(MK_INTERFACE_B1, "Следующий этап проверки требудет действий оператора. Для проверки ВЫХодов\n"
+			"(-27 В) - 'Выход 1', 'Выход 2', 'Выход 3' и 'Выход 4' - будут поочередно загоратьтся и потухать соответсвтующие светодиоды.\n"
+			"Их свечение необходимо подтвердить или не подтвердить путем нажатия на соответствующую кнопку.\n"
+			"Проверка начата...\n"
+			);
+
+		// ниже мы начинаем проверку выходов (-27 В), выходы 1-4,поочередно включая и выключая светодиоды "Выход 1", "...2" и "...3" 
+		// ПРОВЕРКА ВИЗУАЛЬНАЯ (глазами оператора)
+			
+		PORTA |= (1 << PA0);
+
+		Soobshenie_po_CAN(MK_INTERFACE_B1, "Светодиод 'Выход 1' загорелся?\n");
+
+		//отправляем запрос оператору
+		canOutput.can_id	= 0xAAA;
+		canOutput.can_dlc	= 2;
+		canOutput.data[0]	= 0xB2;  
+		canOutput.data[1]	= 0x01;  
+
+		canResult = canModule.sendMessage(&canOutput);
+
+		do{}  // делаем ничего, пока...
+		while(
+				!
+				(
+					canModule.readMessage(&canInput) == MCP2515::ERROR_OK  // пришло какое то сообщение
+					&&
+					(canInput.data[0] = 0xB2)  // 1-й байт B2
+				)
+			); // если пришел ответ на запрос оператору
+		
+
+		if (canInput.data[1] = 0x01)  { // если ответ "ДА" 
+
+			PORTA &= ~(1 << PA0);
+	
+			Soobshenie_po_CAN(MK_INTERFACE_B1, "'Выход 1' исправен!\n");
+				
+			PORTA |= (1 << PA1); 
+
+			Soobshenie_po_CAN(MK_INTERFACE_B1, "Светодиод 'Выход 2' загорелся?\n");
+
+			//отправляем запрос оператору
+			canOutput.can_id	= 0xAAA;
+			canOutput.can_dlc	= 2;
+			canOutput.data[0]	= 0xB2;  
+			canOutput.data[1]	= 0x01;  
+
+			canResult = canModule.sendMessage(&canOutput);
+
+			do{}
+			while(
+					!
+					(
+						canModule.readMessage(&canInput) == MCP2515::ERROR_OK
+						&&
+						(canInput.data[0] = 0xB2)
+					)
+				); // если пришел ответ на запрос оператору
+
+			if (canInput.data[1] = 0x01)  { // если ответ "ДА" 
+
+				PORTA &= ~(1 << PA0);
+
+				Soobshenie_po_CAN(MK_INTERFACE_B1, "'Выход 2' исправен!\n");
+				
+				PORTA |= (1 << PA1); 
+
+				Soobshenie_po_CAN(MK_INTERFACE_B1, "Светодиод 'Выход 3' загорелся?\n");
+
+				//отправляем запрос оператору
+				canOutput.can_id	= 0xAAA;
+				canOutput.can_dlc	= 2;
+				canOutput.data[0]	= 0xB2;  
+				canOutput.data[1]	= 0x01;  
+
+				canResult = canModule.sendMessage(&canOutput);
+
+				do{}
+				while(
+						!
+						(
+							canModule.readMessage(&canInput) == MCP2515::ERROR_OK
+							&&
+							(canInput.data[0] = 0xB2)
+						)
+					); // если пришел ответ на запрос оператору
+
+				if (canInput.data[1] = 0x01)  { // если ответ "ДА"
+
+					PORTA &= ~(1 << PA1);
+
+					Soobshenie_po_CAN(MK_INTERFACE_B1, "'Выход 3' исправен!\n");
+					
+					PORTA |= (1 << PA2); 
+	
+					Soobshenie_po_CAN(MK_INTERFACE_B1, "Светодиод 'Выход 3' загорелся?\n");
+	
+					//отправляем запрос оператору
+					canOutput.can_id	= 0xAAA;
+					canOutput.can_dlc	= 2;
+					canOutput.data[0]	= 0xB2;  
+					canOutput.data[1]	= 0x01;  
+	
+					canResult = canModule.sendMessage(&canOutput);
+
+					do{}
+					while(
+							!
+							(
+								canModule.readMessage(&canInput) == MCP2515::ERROR_OK
+								&&
+								(canInput.data[0] = 0xB2)
+							)
+						); // если пришел ответ на запрос оператору
+
+					if (canInput.data[1] = 0x01)  { // если ответ "ДА"
+					
+						PORTA &= ~(1 << PA2);
+
+						Soobshenie_po_CAN(MK_INTERFACE_B1, "'Выход 3' исправен!\n"
+						"Следующим шагом проверяется коммутация МПИ\n"
+						"Проверка начата...\n"
+						);
+
+						// проверяем коммутацию МПИ
+						// пускаем сигнал из PA1, далее: если сигнал не приходит одновременно на PD4 и PD5 - коммутация присутствует, иначе - отсутствует 
+
+						PORTA |= (1 << PA1); 
+						_delay_ms(1000); 
+						check_port_PD4_PD5_pins();
+
+						if ((signal_received_PD[4] = 0) && (signal_received_PD[5] = 0)) {
+			
+							Soobshenie_po_CAN(MK_INTERFACE_B1, "Коммутация присутствует!\n"
+							"Оператор, проверь наличие сопротивления 75 Ом между клеммами 'Вход МПИ-' и'Вход МПИ+'!\n"
+							"Сопротивление присутствует?\n"
+							);
+
+							//отправляем запрос оператору
+							canOutput.can_id	= 0xAAA;
+							canOutput.can_dlc	= 2;
+							canOutput.data[0]	= 0xB2;  
+							canOutput.data[1]	= 0x01;  
+	
+							canResult = canModule.sendMessage(&canOutput);
+
+							do{}
+							while(
+									!
+									(
+										canModule.readMessage(&canInput) == MCP2515::ERROR_OK
+										&&
+										(canInput.data[0] = 0xB2)
+									)
+								); // если пришел ответ на запрос оператору
+
+							if (canInput.data[1] = 0x01)  { // если ответ "ДА"
+							
+								Soobshenie_po_CAN(MK_INTERFACE_B1, "МОДУЛЬ ИСПРАВЕН!\n");
+							
+							}
+
+							else if (canInput.data[1] == 0x02) {
+
+								Soobshenie_po_CAN(MK_INTERFACE_B1, "МОДУЛЬ НЕ ИСПРАВЕН!\n"
+								"Устраните неисправность и повторите проверку!\n"
+								);
+
+								return;
+
+							}
+
+						}
+
+						else {
+
+							Soobshenie_po_CAN(MK_INTERFACE_B1, "Коммутация отсутствует! МОДУЛЬ НЕ ИСПРАВЕН!\n"
+							"Устраните неисправность и повторите проверку!\n"
+							);
+
+							return;
+
+						}
+
+					}
+
+					else if (canInput.data[1] == 0x02) {  // если ответ "НЕТ"
+
+					check_port_b0_pins();
+
+					if (signal_received_PB[0] = 1) {
+						Soobshenie_po_CAN(MK_INTERFACE_B1, "'Выход 3' исправен! Вероятно, не исправен светодиод!\n");
+						}
+			
+					else if  (signal_received_PB[0] = 0) {
+						Soobshenie_po_CAN(MK_INTERFACE_B1, "'Выход 3' НЕ исправен!\n");
+						}
+			
+						PORTA &= ~(1 << PA1);
+			
+						return;
+					}
+
+				}
+				
+				else if (canInput.data[1] == 0x02) {  // если ответ "НЕТ"
+
+				check_port_b0_pins();
+		
+				if (signal_received_PB[0] = 1) {
+					Soobshenie_po_CAN(MK_INTERFACE_B1, "'Выход 2' исправен! Вероятно, не исправен светодиод!\n");
+					}
+		
+					else if  (signal_received_PB[0] = 0) {
+					Soobshenie_po_CAN(MK_INTERFACE_B1, "'Выход 2' НЕ исправен!\n");
+					}
+		
+					PORTA &= ~(1 << PA1);
+		
+					return; 
+
+				}  
+
+			}
+
+		}
+
+		else if (canInput.data[1] == 0x02) {  // если ответ "НЕТ"
+
+			check_port_b0_pins();
+
+			if (signal_received_PB[0] = 1) {
+				Soobshenie_po_CAN(MK_INTERFACE_B1, "'Выход 1' исправен! Вероятно, не исправен светодиод!\n");
+				}
+
+				else if  (signal_received_PB[0] = 0) {
+				Soobshenie_po_CAN(MK_INTERFACE_B1, "'Выход 1' НЕ исправен!\n");
+				}
+
+				PORTA &= ~(1 << PA0);
+
+				return; 
+
+		}  
+					
+	} 
+
+	if ((prov_nepr_work_MK == 1) && (timer <=172800000))  {   
+
+		Prov_vx_vix(1,9,1);
+		Prov_vx_vix(2,10,2);
+		Prov_vx_vix(3,11,3);
+		Prov_vx_vix(4,12,4);
+		Prov_vx_vix(5,13,5);
+		Prov_vx_vix(6,14,6);
+		Prov_vx_vix(7,15,7);
+		Prov_vx_vix(8,16,8);
+	}
+	else  {
+		// если прошло 172800000 - останавливаем непрерывную проверку
+		prov_nepr_work_MK = 0;
+		}
+	
+	if (modul_ispraven = 1)  {
+
+		Soobshenie_po_CAN(MK_INTERFACE_B1, "МОДУЛЬ ИСПРАВЕН!\n");
+	
+	}
+
+}  
