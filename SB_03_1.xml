@@ -1,0 +1,27 @@
+<Config>
+	<Button name="pushButton_9"  
+	text="Запустить проверку функционирования"
+	function="FUNC_zapustit_razovuiy_proverky"
+	fontSize="12"/>
+
+	<Button name="pushButton_10"  
+	text="Запустить НЕПРЕРЫВНУЮ проверку"
+	function="FUNC_zapustit_neprerivnuiy_proverky"
+	fontSize="12"/>
+
+	<Button name="pushButton_11"  
+	text="Остановить НЕПРЕРЫВНУЮ проверку"
+	function="FUNC_ostanovka_neprerivnoi_proverki"
+	fontSize="12"/>
+
+	<Button name="pushButton_12"  
+	enabled="false"/>
+
+	<Button name="pushButton_13"  
+	enabled="false"/>
+
+	<Button name="pushButton_14"  
+	enabled="false"/>
+</Config>
+
+
